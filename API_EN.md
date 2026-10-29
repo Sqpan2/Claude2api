@@ -177,7 +177,11 @@ data: [DONE]
 
 ### `POST /v1/messages`
 
-Anthropic Messages-compatible endpoint.
+Anthropic Messages-compatible endpoint. The `dev` branch supports client-owned
+`tools`, `tool_choice`, `tool_use` and `tool_result.tool_use_id` in both JSON and
+named SSE responses. The proxy never executes client tools. See
+[Client tools and magpie configuration](docs/CLIENT_TOOLS.md) for the lifecycle,
+buffered tool streaming and limitations.
 
 ### Request
 

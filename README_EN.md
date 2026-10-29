@@ -2,6 +2,11 @@
 
 `claude2api` is a Go/Gin proxy that exposes OpenAI-compatible and Anthropic-compatible HTTP endpoints backed by the claude.ai web API.
 
+The `dev` branch supports client-owned `tool_use` / `tool_result` on
+`POST /v1/messages`, including magpie forwarding to local Claude Code. It removes
+server-side client tool execution. See [Client tools](docs/CLIENT_TOOLS.md) for
+configuration, protocol details and limitations.
+
 It reverse-proxies requests to `https://claude.ai` using a browser-like TLS/client environment and returns standard JSON or Server-Sent Events (SSE) responses for common API clients.
 
 ## Features

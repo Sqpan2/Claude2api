@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"encoding/json"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -19,61 +18,50 @@ After text.
 
 [TOOL_CALL]{"name":"Read","id":"toolu_2","input":{"file_path":"a.txt"}}[/TOOL_CALL]`
 
-	stripped, calls := extractToolCalls(text)
-	if len(calls) != 2 {
-		t.Fatalf("expected 2 calls, got %d", len(calls))
+	tools, err := prepareClientTools(models.AnthropicRequest{ToolDefs: []models.AnthropicTool{
+		{Name: "Bash", InputSchema: map[string]interface{}{"type": "object"}},
+		{Name: "Read", InputSchema: map[string]interface{}{"type": "object"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if calls[0].Name != "Bash" || calls[0].ID != "toolu_1" {
-		t.Fatalf("first call wrong: %+v", calls[0])
+	blocks, stop, err := tools.parse(text)
+	if err != nil || stop != "tool_use" {
+		t.Fatalf("parse: %s, %v", stop, err)
 	}
-	if calls[1].Name != "Read" {
-		t.Fatalf("second call wrong: %+v", calls[1])
+	var names []string
+	var plain string
+	for _, block := range blocks {
+		if block.Type == "tool_use" {
+			names = append(names, block.Name)
+		} else {
+			plain += block.Text
+		}
 	}
-	if strings.Contains(stripped, "[TOOL_CALL]") {
-		t.Fatalf("stripped still contains marker: %s", stripped)
-	}
-	if !strings.Contains(stripped, "Here is help") || !strings.Contains(stripped, "After text") {
-		t.Fatalf("stripped lost plain text: %s", stripped)
+	if strings.Join(names, ",") != "Bash,Read" || !strings.Contains(plain, "Here is help") || !strings.Contains(plain, "After text") {
+		t.Fatalf("lost tool calls or text: %+v", blocks)
 	}
 }
 
 func TestExtractToolCallsNone(t *testing.T) {
 	text := "plain text with no calls"
-	stripped, calls := extractToolCalls(text)
-	if len(calls) != 0 {
-		t.Fatalf("expected 0 calls, got %d", len(calls))
-	}
-	if stripped != text {
-		t.Fatalf("text changed: %s", stripped)
-	}
-}
-
-func TestToolBashAndRead(t *testing.T) {
-	out := executeTool("Bash", map[string]interface{}{"command": "echo hello"})
-	if !strings.Contains(out, "hello") {
-		t.Fatalf("bash output wrong: %q", out)
-	}
-
-	// Write then Read
-	defer os.Remove("test_tool_tmp.txt")
-	executeTool("Write", map[string]interface{}{"file_path": "test_tool_tmp.txt", "content": "line1\nline2"})
-	out = executeTool("Read", map[string]interface{}{"file_path": "test_tool_tmp.txt"})
-	if !strings.Contains(out, "line1") {
-		t.Fatalf("read output wrong: %q", out)
+	blocks, stop, err := (&clientTools{}).parse(text)
+	if err != nil || stop != "end_turn" || len(blocks) != 1 || blocks[0].Text != text {
+		t.Fatalf("text changed: %+v, %s, %v", blocks, stop, err)
 	}
 }
 
 func TestAnthropicContentToToolText(t *testing.T) {
 	blocks := []interface{}{
 		map[string]interface{}{"type": "tool_use", "name": "Bash", "id": "toolu_1", "input": map[string]interface{}{"command": "echo"}},
-		map[string]interface{}{"type": "tool_result", "use_id": "toolu_1", "content": "hello"},
+		map[string]interface{}{"type": "tool_result", "tool_use_id": "toolu_1", "content": "hello", "is_error": true},
 		map[string]interface{}{"type": "text", "text": "done"},
 	}
 	got := anthropicContentToToolText(blocks)
-	if !strings.Contains(got, "Tool Use: Bash (toolu_1)") {
+	if !strings.Contains(got, `"name":"Bash"`) {
 		t.Fatalf("missing tool_use text: %q", got)
 	}
-	if !strings.Contains(got, "Tool Result: toolu_1") {
+	if !strings.Contains(got, `"tool_use_id":"toolu_1"`) || !strings.Contains(got, `"is_error":true`) {
 		t.Fatalf("missing tool_result text: %q", got)
 	}
 	if !strings.Contains(got, "hello") || !strings.Contains(got, "done") {
@@ -83,7 +71,7 @@ func TestAnthropicContentToToolText(t *testing.T) {
 
 func TestToolDefsPrompt(t *testing.T) {
 	tools := []models.AnthropicTool{{Name: "Bash", InputSchema: map[string]interface{}{"type": "object"}}}
-	p := buildToolDefsPrompt(tools)
+	p := buildToolDefsPrompt(models.AnthropicRequest{ToolDefs: tools})
 	if !strings.Contains(p, "TOOL_CALL") || !strings.Contains(p, "Bash") {
 		t.Fatalf("defs prompt wrong: %q", p)
 	}

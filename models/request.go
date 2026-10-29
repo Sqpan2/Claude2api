@@ -66,24 +66,31 @@ type AnthropicTool struct {
 
 // AnthropicRequest is the Anthropic Messages API request.
 type AnthropicRequest struct {
-	Model          string             `json:"model"`
-	Messages       []AnthropicMessage `json:"messages"`
-	System         interface{}        `json:"system,omitempty"`
-	MaxTokens      int                `json:"max_tokens"`
-	Stream         bool               `json:"stream,omitempty"`
-	ConversationID string             `json:"conversation_id,omitempty"`
-	ToolDefs       []AnthropicTool    `json:"tools,omitempty"`
-	Thinking       interface{}        `json:"thinking,omitempty"`
-	Temperature    float64            `json:"temperature,omitempty"`
-	TopP           float64            `json:"top_p,omitempty"`
-	TopK           int                `json:"top_k,omitempty"`
-	StopSequences  []string           `json:"stop_sequences,omitempty"`
+	Model          string              `json:"model"`
+	Messages       []AnthropicMessage  `json:"messages"`
+	System         interface{}         `json:"system,omitempty"`
+	MaxTokens      int                 `json:"max_tokens"`
+	Stream         bool                `json:"stream,omitempty"`
+	ConversationID string              `json:"conversation_id,omitempty"`
+	ToolDefs       []AnthropicTool     `json:"tools,omitempty"`
+	ToolChoice     AnthropicToolChoice `json:"tool_choice,omitempty"`
+	Thinking       interface{}         `json:"thinking,omitempty"`
+	Temperature    float64             `json:"temperature,omitempty"`
+	TopP           float64             `json:"top_p,omitempty"`
+	TopK           int                 `json:"top_k,omitempty"`
+	StopSequences  []string            `json:"stop_sequences,omitempty"`
 }
 
 // AnthropicMessage content can be a string or an array of content blocks.
 type AnthropicMessage struct {
 	Role    string      `json:"role"`
 	Content interface{} `json:"content"`
+}
+
+type AnthropicToolChoice struct {
+	Type                   string `json:"type,omitempty"`
+	Name                   string `json:"name,omitempty"`
+	DisableParallelToolUse bool   `json:"disable_parallel_tool_use,omitempty"`
 }
 
 // AnthropicContentBlock is shared by Anthropic-compatible requests and responses.
@@ -95,8 +102,29 @@ type AnthropicContentBlock struct {
 	Input        map[string]interface{} `json:"input,omitempty"`
 	Content      interface{}            `json:"content,omitempty"`
 	IsError      *bool                  `json:"is_error,omitempty"`
-	UseID        string                 `json:"use_id,omitempty"`
+	ToolUseID    string                 `json:"tool_use_id,omitempty"`
 	CacheControl interface{}            `json:"cache_control,omitempty"`
+}
+
+// Empty text and empty tool input objects are required by the Messages wire format.
+func (b AnthropicContentBlock) MarshalJSON() ([]byte, error) {
+	type alias AnthropicContentBlock
+	var text *string
+	var input *map[string]interface{}
+	if b.Type == "text" {
+		text = &b.Text
+	}
+	if b.Type == "tool_use" {
+		if b.Input == nil {
+			b.Input = map[string]interface{}{}
+		}
+		input = &b.Input
+	}
+	return json.Marshal(struct {
+		alias
+		Text  *string                 `json:"text,omitempty"`
+		Input *map[string]interface{} `json:"input,omitempty"`
+	}{alias: alias(b), Text: text, Input: input})
 }
 
 // ClaudeCreateConversationRequest is sent to claude.ai when creating a conversation.

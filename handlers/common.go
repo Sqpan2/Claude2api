@@ -110,11 +110,13 @@ func (h *Handler) deleteTemporaryConversation(client *claude.Client, conversatio
 // runCompletion drives a full claude.ai round-trip: create conversation, send
 // prompt, then invoke onText for each incremental text delta.
 // Returns the accumulated thinking text, the accumulated text, or an error.
-// When tools is nil, the default claude.ai web tools are sent; pass an empty
-// slice (or custom payload) to override — used by the tool-simulation loop.
+// When tools is nil, the default claude.ai web tools are sent; pass a single
+// raw JSON payload containing [] to disable web tools for client tool requests.
 // thinking overrides the proxy-level thinking config (e.g. from request body).
 func (h *Handler) runCompletion(ctx context.Context, client *claude.Client, prompt, claudeModel, effort, conversationID, accountID string,
 	onText func(text string), tools []json.RawMessage, thinkingOverride ...string) (string, string, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	convID := ""
 	persistent := conversationID != ""
@@ -199,6 +201,7 @@ func (h *Handler) runCompletion(ctx context.Context, client *claude.Client, prom
 	}
 
 	var thinkingBuf, sb strings.Builder
+	stopped := false
 	for evt := range events {
 		if evt.Error != nil {
 			return thinkingBuf.String(), sb.String(), fmt.Errorf("upstream: %s", evt.Error.Message)
@@ -215,8 +218,15 @@ func (h *Handler) runCompletion(ctx context.Context, client *claude.Client, prom
 			}
 		}
 		if claude.IsStopEvent(evt) {
+			stopped = true
 			break
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return thinkingBuf.String(), sb.String(), err
+	}
+	if !stopped {
+		return thinkingBuf.String(), sb.String(), fmt.Errorf("upstream stream ended without a stop event")
 	}
 	if persistent {
 		state.LastHumanUUID = humanUUID

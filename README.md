@@ -9,6 +9,12 @@
 
 详细接口说明见：[API.md](API.md)。
 
+### dev 分支：本机工具调用
+
+`POST /v1/messages` 支持标准客户端 `tool_use` / `tool_result`，可经 magpie
+交给本机 Claude Code 执行。此分支已移除代理服务器上的工具执行循环。
+接入方式、协议与限制见 [客户端工具说明](docs/CLIENT_TOOLS.md)。
+
 ## 功能特性
 
 - OpenAI Chat Completions 兼容接口：`POST /v1/chat/completions`

@@ -1,300 +1,212 @@
 package handlers
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"io/fs"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"regexp"
+	"io"
 	"strings"
-	"time"
 
 	"claude2api/models"
+	"claude2api/utils"
 
-	"github.com/bmatcuk/doublestar/v4"
+	"github.com/santhosh-tekuri/jsonschema/v5"
 )
 
-// MaxToolRounds caps the tool-use loop so a misbehaving model cannot spin forever.
-const MaxToolRounds = 24
-
-// toolCall is a parsed [TOOL_CALL]...[/TOOL_CALL] instruction from the model text.
-type toolCall struct {
-	Name  string
-	ID    string
-	Input map[string]interface{}
-	Raw   string
+// Tool execution belongs to the API client. Only validate and translate here.
+type clientTools struct {
+	schemas map[string]*jsonschema.Schema
+	choice  models.AnthropicToolChoice
 }
 
-var toolCallRe = regexp.MustCompile(`(?s)\[TOOL_CALL\]\s*(\{[\s\S]*?\})\s*\[/TOOL_CALL\]`)
-
-// extractToolCalls parses all tool calls embedded in the model's text.
-// Returns the text stripped of tool-call markers, and the parsed calls.
-func extractToolCalls(text string) (string, []toolCall) {
-	var calls []toolCall
-	matches := toolCallRe.FindAllStringSubmatch(text, -1)
-	if len(matches) == 0 {
-		return text, nil
-	}
-	for _, m := range matches {
-		var raw map[string]interface{}
-		if err := json.Unmarshal([]byte(m[1]), &raw); err != nil {
-			continue
+func prepareClientTools(req models.AnthropicRequest) (*clientTools, error) {
+	t := &clientTools{schemas: make(map[string]*jsonschema.Schema), choice: req.ToolChoice}
+	for i, tool := range req.ToolDefs {
+		if tool.Name == "" {
+			return nil, fmt.Errorf("tools[%d].name is required", i)
 		}
-		name, _ := raw["name"].(string)
-		id, _ := raw["id"].(string)
-		if name == "" {
-			continue
+		if _, exists := t.schemas[tool.Name]; exists {
+			return nil, fmt.Errorf("duplicate tool name %q", tool.Name)
 		}
-		if id == "" {
-			id = fmt.Sprintf("toolu_%d", time.Now().UnixNano())
+		if tool.InputSchema == nil {
+			return nil, fmt.Errorf("tool %q requires input_schema", tool.Name)
 		}
-		input, _ := raw["input"].(map[string]interface{})
-		if input == nil {
-			// allow flat args
-			input = map[string]interface{}{}
-			for k, v := range raw {
-				if k == "name" || k == "id" {
-					continue
-				}
-				input[k] = v
-			}
-		}
-		calls = append(calls, toolCall{Name: name, ID: id, Input: input, Raw: m[0]})
-	}
-	stripped := toolCallRe.ReplaceAllString(text, "")
-	return stripped, calls
-}
-
-// runTool executes a single tool call and returns Anthropic content blocks.
-func runTool(call toolCall) []models.AnthropicContentBlock {
-	out := executeTool(call.Name, call.Input)
-	return []models.AnthropicContentBlock{{
-		Type:      "text",
-		Text:      out,
-		ID:        call.ID,
-		Name:      call.Name,
-		Content:   out,
-		IsError:   boolPtr(false),
-	}}
-}
-
-func boolPtr(b bool) *bool { return &b }
-
-func toolContext(timeout time.Duration) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), timeout)
-}
-
-// executeTool runs the requested tool and returns its textual output.
-func executeTool(name string, input map[string]interface{}) string {
-	switch name {
-	case "Bash":
-		return toolBash(input)
-	case "Read":
-		return toolRead(input)
-	case "Write":
-		return toolWrite(input)
-	case "Edit":
-		return toolEdit(input)
-	case "Glob":
-		return toolGlob(input)
-	case "Grep":
-		return toolGrep(input)
-	case "WebFetch":
-		return toolUnsupported(name, input)
-	default:
-		return fmt.Sprintf("ERROR: unknown tool %q", name)
-	}
-}
-
-func toolBash(input map[string]interface{}) string {
-	cmd, _ := input["command"].(string)
-	if cmd == "" {
-		return "ERROR: Bash requires 'command'"
-	}
-	// Safety: block obviously dangerous interactive / destructive patterns.
-	dangerous := []string{"rm -rf /", "mkfs", ":(){:|:&};:", "dd if=/dev/zero"}
-	for _, d := range dangerous {
-		if strings.Contains(cmd, d) {
-			return fmt.Sprintf("ERROR: blocked dangerous command pattern: %s", d)
-		}
-	}
-	timeout := 120 * time.Second
-	if t, ok := input["timeout"].(float64); ok && t > 0 {
-		timeout = time.Duration(t) * time.Millisecond
-	}
-	ctx, cancel := toolContext(timeout)
-	defer cancel()
-
-	execCmd := exec.CommandContext(ctx, "cmd", "/c", cmd)
-	if os.PathSeparator == '/' {
-		execCmd = exec.CommandContext(ctx, "bash", "-c", cmd)
-	}
-	out, err := execCmd.CombinedOutput()
-	if ctx.Err() == context.DeadlineExceeded {
-		return fmt.Sprintf("ERROR: command timed out after %v\n%s", timeout, truncate(string(out), 2000))
-	}
-	if err != nil {
-		return fmt.Sprintf("ERROR: %v\n%s", err, truncate(string(out), 2000))
-	}
-	return truncate(string(out), 8000)
-}
-
-func toolRead(input map[string]interface{}) string {
-	path, _ := input["file_path"].(string)
-	if path == "" {
-		return "ERROR: Read requires 'file_path'"
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Sprintf("ERROR: read %s: %v", path, err)
-	}
-	content := string(data)
-	if off, ok := input["offset"].(float64); ok && off > 0 {
-		lines := strings.Split(content, "\n")
-		start := int(off)
-		if start < len(lines) {
-			content = strings.Join(lines[start:], "\n")
-		} else {
-			content = ""
-		}
-	}
-	if lim, ok := input["limit"].(float64); ok && lim > 0 {
-		lines := strings.Split(content, "\n")
-		if int(lim) < len(lines) {
-			content = strings.Join(lines[:int(lim)], "\n")
-		}
-	}
-	return truncate(content, 8000)
-}
-
-func toolWrite(input map[string]interface{}) string {
-	path, _ := input["file_path"].(string)
-	content, _ := input["content"].(string)
-	if path == "" {
-		return "ERROR: Write requires 'file_path'"
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil && filepath.Dir(path) != "" {
-		return fmt.Sprintf("ERROR: mkdir %s: %v", filepath.Dir(path), err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		return fmt.Sprintf("ERROR: write %s: %v", path, err)
-	}
-	return fmt.Sprintf("Wrote %d bytes to %s", len(content), path)
-}
-
-func toolEdit(input map[string]interface{}) string {
-	path, _ := input["file_path"].(string)
-	oldStr, _ := input["old_string"].(string)
-	newStr, _ := input["new_string"].(string)
-	if path == "" || oldStr == "" {
-		return "ERROR: Edit requires 'file_path' and 'old_string'"
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Sprintf("ERROR: read %s: %v", path, err)
-	}
-	content := string(data)
-	count := strings.Count(content, oldStr)
-	if count == 0 {
-		return fmt.Sprintf("ERROR: old_string not found in %s", path)
-	}
-	if count > 1 {
-		return fmt.Sprintf("ERROR: old_string appears %d times in %s; provide more surrounding context", count, path)
-	}
-	content = strings.Replace(content, oldStr, newStr, 1)
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		return fmt.Sprintf("ERROR: write %s: %v", path, err)
-	}
-	return fmt.Sprintf("Edited %s", path)
-}
-
-func toolGlob(input map[string]interface{}) string {
-	pattern, _ := input["pattern"].(string)
-	path, _ := input["path"].(string)
-	if pattern == "" {
-		pattern = "**/*"
-	}
-	if path == "" {
-		path = "."
-	}
-	matches, err := doublestar.Glob(os.DirFS(path), pattern, doublestar.WithFilesOnly())
-	if err != nil {
-		return fmt.Sprintf("ERROR: glob %s: %v", pattern, err)
-	}
-	if len(matches) > 2000 {
-		matches = matches[:2000]
-	}
-	return strings.Join(matches, "\n")
-}
-
-func toolGrep(input map[string]interface{}) string {
-	pattern, _ := input["pattern"].(string)
-	if pattern == "" {
-		return "ERROR: Grep requires 'pattern'"
-	}
-	path, _ := input["path"].(string)
-	if path == "" {
-		path = "."
-	}
-	regex, err := regexp.Compile(pattern)
-	if err != nil {
-		return fmt.Sprintf("ERROR: invalid regex %s: %v", pattern, err)
-	}
-	var results []string
-	walkErr := doublestar.GlobWalk(os.DirFS(path), "**/*", func(p string, d os.DirEntry) error {
-		if d.IsDir() {
-			return nil
-		}
-		full := filepath.Join(path, p)
-		info, err := os.Stat(full)
-		if err != nil || info.Size() > 1<<20 {
-			return nil
-		}
-		data, err := os.ReadFile(full)
+		data, err := json.Marshal(tool.InputSchema)
 		if err != nil {
-			return nil
+			return nil, fmt.Errorf("invalid input_schema for tool %q", tool.Name)
 		}
-		if isBinary(data) {
-			return nil
+		compiler := jsonschema.NewCompiler()
+		// Client-supplied schemas must never cause external network requests.
+		compiler.LoadURL = func(string) (io.ReadCloser, error) {
+			return nil, fmt.Errorf("external schema references are not supported")
 		}
-		for i, line := range strings.Split(string(data), "\n") {
-			if regex.MatchString(line) {
-				results = append(results, fmt.Sprintf("%s:%d:%s", full, i+1, line))
-				if len(results) >= 2000 {
-					return fs.SkipDir
+		url := "https://claude2api.invalid/tool.json"
+		if err := compiler.AddResource(url, strings.NewReader(string(data))); err != nil {
+			return nil, fmt.Errorf("invalid input_schema for tool %q: %w", tool.Name, err)
+		}
+		schema, err := compiler.Compile(url)
+		if err != nil {
+			return nil, fmt.Errorf("invalid input_schema for tool %q: %w", tool.Name, err)
+		}
+		t.schemas[tool.Name] = schema
+	}
+	switch t.choice.Type {
+	case "", "auto", "none":
+	case "any":
+		if len(t.schemas) == 0 {
+			return nil, fmt.Errorf("tool_choice any requires tools")
+		}
+	case "tool":
+		if _, exists := t.schemas[t.choice.Name]; !exists {
+			return nil, fmt.Errorf("tool_choice names an undefined tool")
+		}
+	default:
+		return nil, fmt.Errorf("unsupported tool_choice %q", t.choice.Type)
+	}
+	return t, validateToolHistory(req.Messages)
+}
+
+func validateToolHistory(messages []models.AnthropicMessage) error {
+	pending := make(map[string]bool)
+	seen := make(map[string]bool)
+	for _, message := range messages {
+		blocks, _ := message.Content.([]interface{})
+		if len(pending) > 0 && message.Role != "user" {
+			return fmt.Errorf("tool_use must be followed by user tool_result blocks")
+		}
+		for _, item := range blocks {
+			block, _ := item.(map[string]interface{})
+			switch block["type"] {
+			case "tool_use":
+				id, _ := block["id"].(string)
+				if message.Role != "assistant" || id == "" || seen[id] {
+					return fmt.Errorf("tool_use requires an assistant message and a unique id")
 				}
+				seen[id], pending[id] = true, true
+			case "tool_result":
+				id, _ := block["tool_use_id"].(string)
+				if message.Role != "user" || !pending[id] {
+					return fmt.Errorf("tool_result must reference a pending tool_use_id")
+				}
+				delete(pending, id)
 			}
 		}
-		return nil
-	})
-	if walkErr != nil {
-		return fmt.Sprintf("ERROR: walk %s: %v", path, walkErr)
+		if message.Role == "user" && len(pending) > 0 {
+			return fmt.Errorf("user message must include results for all pending tool calls")
+		}
 	}
-	return strings.Join(results, "\n")
-}
-
-func toolUnsupported(name string, input map[string]interface{}) string {
-	b, _ := json.Marshal(input)
-	return fmt.Sprintf("ERROR: tool %q is not supported by claude2api yet. Input: %s", name, truncate(string(b), 500))
-}
-
-// --- helpers ---
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
+	if len(pending) > 0 {
+		return fmt.Errorf("missing tool_result for pending tool calls")
 	}
-	return s[:n] + fmt.Sprintf("\n... [truncated %d chars]", len(s)-n)
+	return nil
 }
 
-func isBinary(data []byte) bool {
-	for _, b := range data {
-		if b == 0 {
-			return true
+func hasToolHistory(messages []models.AnthropicMessage) bool {
+	for _, message := range messages {
+		blocks, _ := message.Content.([]interface{})
+		for _, item := range blocks {
+			block, _ := item.(map[string]interface{})
+			if block["type"] == "tool_use" || block["type"] == "tool_result" {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+func (t *clientTools) parse(text string) ([]models.AnthropicContentBlock, string, error) {
+	blocks := make([]models.AnthropicContentBlock, 0)
+	calls := 0
+	for {
+		start := strings.Index(text, "[TOOL_CALL]")
+		if start < 0 {
+			if strings.Contains(text, "[/TOOL_CALL]") {
+				return nil, "", fmt.Errorf("unmatched tool-call closing marker")
+			}
+			if text != "" {
+				blocks = append(blocks, models.AnthropicContentBlock{Type: "text", Text: text})
+			}
+			break
+		}
+		if start > 0 {
+			blocks = append(blocks, models.AnthropicContentBlock{Type: "text", Text: text[:start]})
+		}
+		rest := text[start+len("[TOOL_CALL]"):]
+		var call struct {
+			Name  string                 `json:"name"`
+			Input map[string]interface{} `json:"input"`
+		}
+		decoder := json.NewDecoder(strings.NewReader(rest))
+		if err := decoder.Decode(&call); err != nil {
+			return nil, "", fmt.Errorf("invalid tool-call JSON")
+		}
+		rest = strings.TrimLeft(rest[decoder.InputOffset():], " \t\r\n")
+		if !strings.HasPrefix(rest, "[/TOOL_CALL]") {
+			return nil, "", fmt.Errorf("missing tool-call closing marker")
+		}
+		schema, exists := t.schemas[call.Name]
+		if !exists || t.choice.Type == "none" {
+			return nil, "", fmt.Errorf("model requested an unavailable tool")
+		}
+		if t.choice.Type == "tool" && call.Name != t.choice.Name {
+			return nil, "", fmt.Errorf("model did not follow tool_choice")
+		}
+		if call.Input == nil {
+			return nil, "", fmt.Errorf("tool input must be a JSON object")
+		}
+		if err := schema.Validate(call.Input); err != nil {
+			return nil, "", fmt.Errorf("model tool input does not match input_schema for %q", call.Name)
+		}
+		calls++
+		if calls > 64 || (t.choice.DisableParallelToolUse && calls > 1) {
+			return nil, "", fmt.Errorf("model returned too many tool calls")
+		}
+		// Proxy-generated IDs cannot collide with model IDs reused on later turns.
+		blocks = append(blocks, models.AnthropicContentBlock{
+			Type: "tool_use", ID: "toolu_" + utils.GenerateUUID(), Name: call.Name, Input: call.Input,
+		})
+		text = rest[len("[/TOOL_CALL]"):]
+	}
+	if calls > 0 {
+		return blocks, "tool_use", nil
+	}
+	if t.choice.Type == "any" || t.choice.Type == "tool" {
+		return nil, "", fmt.Errorf("model did not return the required tool call")
+	}
+	if len(blocks) == 0 {
+		blocks = append(blocks, models.AnthropicContentBlock{Type: "text", Text: ""})
+	}
+	return blocks, "end_turn", nil
+}
+
+func buildToolDefsPrompt(req models.AnthropicRequest) string {
+	tools, _ := json.Marshal(req.ToolDefs)
+	choice, _ := json.Marshal(req.ToolChoice)
+	return "\n\n[Client Tools]\n" +
+		"The tools below run on the user's client, never on this web server. " +
+		"To request a tool, output [TOOL_CALL]{\"name\":\"tool_name\",\"input\":{...}}[/TOOL_CALL]. " +
+		"Input must match that tool's input_schema. Only request listed tools. " +
+		"You may include explanatory text and multiple calls. After requesting tools, stop and wait for the user's tool results. " +
+		"Do not invent results or execute client tasks using web tools. " +
+		"If no tools are listed or tool_choice is none, respond with text only. " +
+		"tool_choice any requires a call; tool_choice tool requires its named tool. " +
+		"If disable_parallel_tool_use is true, request at most one tool.\n" +
+		"tools: " + string(tools) + "\ntool_choice: " + string(choice) + "\n[/Client Tools]\n"
+}
+
+func buildToolPrompt(req models.AnthropicRequest) string {
+	parts := []string{"[System]\n" + systemToText(req.System) + buildToolDefsPrompt(req)}
+	for _, message := range req.Messages {
+		parts = append(parts, "["+message.Role+"]\n"+anthropicContentToToolText(message.Content))
+	}
+	parts = append(parts, "[assistant]\n")
+	return strings.Join(parts, "\n\n")
+}
+
+func anthropicContentToToolText(content interface{}) string {
+	if text, ok := content.(string); ok {
+		return text
+	}
+	// Preserve tool_use_id, nested results, is_error and arguments verbatim.
+	data, _ := json.Marshal(content)
+	return string(data)
 }

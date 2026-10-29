@@ -179,7 +179,8 @@ data: [DONE]
 
 ### `POST /v1/messages`
 
-Anthropic Messages 兼容接口。
+Anthropic Messages 兼容接口。`dev` 分支支持标准客户端工具调用，详见
+[客户端工具协议与 magpie 配置](docs/CLIENT_TOOLS.md)。代理不执行客户端工具。
 
 ### 请求体
 
@@ -202,9 +203,11 @@ Anthropic Messages 兼容接口。
 | `model` | string | 否 | 为空时使用 `DEFAULT_MODEL`；可用性由网页上游验证。 |
 | `messages` | array | 是 | 至少一条消息。 |
 | `system` | string | 否 | 作为 system prompt 前置。 |
-| `max_tokens` | integer | 否 | 为空或 0 时默认 `4096`。 |
+| `max_tokens` | integer | 否 | 兼容字段；生成上限由网页端控制，不承诺精确执行。 |
 | `stream` | boolean | 否 | 为 `true` 时返回 Anthropic 风格 SSE。 |
 | `conversation_id` | string | 否 | 传入后启用持久会话，同一个 ID 会复用同一个 claude.ai conversation。 |
+| `tools` | array | 否 | 客户端工具定义；每项含 `name`、`description`、`input_schema`。 |
+| `tool_choice` | object | 否 | `auto`、`none`、`any` 或 `tool`；支持 `disable_parallel_tool_use`。 |
 | `temperature` | number | 否 | 兼容字段。 |
 | `top_p` | number | 否 | 兼容字段。 |
 | `top_k` | integer | 否 | 兼容字段。 |
@@ -238,7 +241,7 @@ Anthropic Messages 兼容接口。
 
 ### 流式事件
 
-响应是 `data: <json>\n\n` 格式的 SSE 流，主要事件：
+响应是 `event: <type>\ndata: <json>\n\n` 格式的 SSE 流，主要事件：
 
 - `message_start`
 - `content_block_start`
@@ -250,18 +253,28 @@ Anthropic Messages 兼容接口。
 示例：
 
 ```text
+event: message_start
 data: {"type":"message_start","message":{"role":"assistant"}}
 
+event: content_block_start
 data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
 
+event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
 
+event: content_block_stop
 data: {"type":"content_block_stop","index":0}
 
+event: message_delta
 data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}
 
+event: message_stop
 data: {"type":"message_stop"}
 ```
+
+工具调用返回 `tool_use` 内容块和 `stop_reason: "tool_use"`，等待客户端回传
+`tool_result.tool_use_id`。工具流会整轮缓冲校验，期间发送 `ping`；错误使用
+`error` 事件，不再发送成功的 `message_stop`。
 
 ## OpenAI Responses API
 

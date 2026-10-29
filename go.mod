@@ -3,10 +3,10 @@ module claude2api
 go 1.26.4
 
 require (
-	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/bogdanfinn/fhttp v0.6.9
 	github.com/bogdanfinn/tls-client v1.16.0
 	github.com/gin-gonic/gin v1.12.0
+	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1
 )
 
 require (

@@ -62,7 +62,7 @@ func resolveEffort(effort string) string {
 
 // resolveThinking maps Claude Code's thinking config to claude.ai's thinking_mode.
 // Claude Code sends {"type":"enabled","budget_tokens":N} or {"type":"disabled"}.
-// claude.ai accepts "auto" | "none". We also return the budget for potential
+// claude.ai accepts "extended", "standard", "auto", or "off". We return the budget for potential
 // future use (claude.ai web does not expose a budget knob).
 func resolveThinking(thinking interface{}) (thinkingMode string, budgetTokens int) {
 	if thinking == nil {
@@ -75,7 +75,7 @@ func resolveThinking(thinking interface{}) (thinkingMode string, budgetTokens in
 	typ, _ := m["type"].(string)
 	switch typ {
 	case "disabled":
-		return "none", 0
+		return "off", 0
 	case "enabled":
 		budget, _ := m["budget_tokens"].(float64)
 		return "auto", int(budget)

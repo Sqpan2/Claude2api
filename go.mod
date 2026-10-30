@@ -5,8 +5,9 @@ go 1.26.4
 require (
 	github.com/bogdanfinn/fhttp v0.6.9
 	github.com/bogdanfinn/tls-client v1.16.0
+	github.com/dlclark/regexp2 v1.12.0
 	github.com/gin-gonic/gin v1.12.0
-	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 )
 
 require (

@@ -3,23 +3,65 @@ package handlers
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"claude2api/models"
 	"claude2api/utils"
 
-	"github.com/santhosh-tekuri/jsonschema/v5"
+	"github.com/dlclark/regexp2"
+	"github.com/santhosh-tekuri/jsonschema/v6"
 )
+
+const toolRegexpTimeout = 100 * time.Millisecond
+
+type toolRegexp struct {
+	*regexp2.Regexp
+	matchFailed *atomic.Bool
+}
+
+func (re toolRegexp) MatchString(s string) bool {
+	matched, err := re.Regexp.MatchString(s)
+	if err != nil {
+		re.matchFailed.Store(true)
+		return false
+	}
+	return matched
+}
+
+func compileToolRegexp(pattern string, matchFailed *atomic.Bool) (jsonschema.Regexp, error) {
+	re, err := regexp2.Compile(pattern, regexp2.ECMAScript)
+	if err != nil {
+		return nil, err
+	}
+	// Client schemas can contain backtracking expressions; timeouts fail closed.
+	re.MatchTimeout = toolRegexpTimeout
+	return toolRegexp{re, matchFailed}, nil
+}
+
+type toolSchema struct {
+	schema      *jsonschema.Schema
+	matchFailed *atomic.Bool
+}
+
+func (s *toolSchema) Validate(value interface{}) error {
+	err := s.schema.Validate(value)
+	// A timeout must reject the whole validation, even inside not/anyOf.
+	if s.matchFailed.Load() {
+		return fmt.Errorf("tool schema regular expression matching failed or timed out")
+	}
+	return err
+}
 
 // Tool execution belongs to the API client. Only validate and translate here.
 type clientTools struct {
-	schemas map[string]*jsonschema.Schema
+	schemas map[string]*toolSchema
 	choice  models.AnthropicToolChoice
 }
 
 func prepareClientTools(req models.AnthropicRequest) (*clientTools, error) {
-	t := &clientTools{schemas: make(map[string]*jsonschema.Schema), choice: req.ToolChoice}
+	t := &clientTools{schemas: make(map[string]*toolSchema), choice: req.ToolChoice}
 	for i, tool := range req.ToolDefs {
 		if tool.Name == "" {
 			return nil, fmt.Errorf("tools[%d].name is required", i)
@@ -35,19 +77,26 @@ func prepareClientTools(req models.AnthropicRequest) (*clientTools, error) {
 			return nil, fmt.Errorf("invalid input_schema for tool %q", tool.Name)
 		}
 		compiler := jsonschema.NewCompiler()
-		// Client-supplied schemas must never cause external network requests.
-		compiler.LoadURL = func(string) (io.ReadCloser, error) {
-			return nil, fmt.Errorf("external schema references are not supported")
+		compiler.DefaultDraft(jsonschema.Draft2020)
+		matchFailed := &atomic.Bool{}
+		compiler.UseRegexpEngine(func(pattern string) (jsonschema.Regexp, error) {
+			return compileToolRegexp(pattern, matchFailed)
+		})
+		// With no URLLoader, external network and file references are rejected.
+		compiler.UseLoader(nil)
+		doc, err := jsonschema.UnmarshalJSON(strings.NewReader(string(data)))
+		if err != nil {
+			return nil, fmt.Errorf("invalid input_schema for tool %q: %w", tool.Name, err)
 		}
 		url := "https://claude2api.invalid/tool.json"
-		if err := compiler.AddResource(url, strings.NewReader(string(data))); err != nil {
+		if err := compiler.AddResource(url, doc); err != nil {
 			return nil, fmt.Errorf("invalid input_schema for tool %q: %w", tool.Name, err)
 		}
 		schema, err := compiler.Compile(url)
 		if err != nil {
 			return nil, fmt.Errorf("invalid input_schema for tool %q: %w", tool.Name, err)
 		}
-		t.schemas[tool.Name] = schema
+		t.schemas[tool.Name] = &toolSchema{schema, matchFailed}
 	}
 	switch t.choice.Type {
 	case "", "auto", "none":

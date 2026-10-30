@@ -160,7 +160,7 @@ func TestResolveThinking(t *testing.T) {
 		wantBudget int
 	}{
 		{nil, "auto", 0},
-		{map[string]interface{}{"type": "disabled"}, "none", 0},
+		{map[string]interface{}{"type": "disabled"}, "off", 0},
 		{map[string]interface{}{"type": "enabled", "budget_tokens": float64(10000)}, "auto", 10000},
 		{map[string]interface{}{"type": "enabled"}, "auto", 0},
 		{"invalid", "auto", 0},

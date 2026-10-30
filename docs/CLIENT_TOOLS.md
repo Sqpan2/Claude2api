@@ -59,7 +59,11 @@ The tool input is empty in `content_block_start`; its arguments appear once in
 `input_json_delta`. Upstream errors, truncated streams, and invalid tool output
 produce HTTP 502 before streaming, or an SSE `error` after streaming starts,
 without a successful `message_stop`. Invalid client tool definitions or result
-IDs produce HTTP 400 before any upstream request. Ordinary text-only requests
+IDs produce HTTP 400 before any upstream request. Tool schema regular expressions
+use regexp2's ECMAScript mode, including lookaheads and backreferences, for both
+schema compilation and tool argument validation. Each match has a 100 ms timeout;
+a timeout rejects the value. External schema references cannot read network or
+file resources. Ordinary text-only requests
 continue to stream incremental text.
 
 ## magpie Configuration
